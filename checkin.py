@@ -80,6 +80,10 @@ EXCHANGE_PLANS = {
     "plan200": {"points": 200, "days": 30},
     "plan500": {"points": 500, "days": 100},
 }
+# 自动兑换模式：EXCHANGE_PLAN=auto 时，仅在剩余天数 <= 阈值时兑换，
+# 按 plan500 → plan200 → plan100 的顺序选积分够得上的最高档，每次只换一档。
+EXCHANGE_AUTO = "auto"
+DEFAULT_EXCHANGE_DAYS_THRESHOLD = 3
 
 
 # ==================== 工具函数 ====================
@@ -619,15 +623,36 @@ def exchange_request(session: requests.Session, headers: Dict[str, str], plan: s
     return require_json(r)
 
 
+def choose_auto_plan(points: Optional[int], left_days: Optional[int], threshold: int) -> Tuple[Optional[str], str]:
+    """
+    自动兑换模式的决策（纯函数，便于测试）。返回 (计划名或 None, 状态描述)。
+
+    - 积分或剩余天数未知：不兑换；
+    - 剩余天数 > 阈值：不兑换，状态为 "-"（不输出到推送）；
+    - 剩余天数 <= 阈值：选积分够得上的最高档；一档都不够则提醒手动处理。
+    """
+    if points is None or left_days is None:
+        return None, "⚠️ 兑换跳过(积分或剩余天数查询失败)"
+    if left_days > threshold:
+        return None, "-"
+    for plan in sorted(EXCHANGE_PLANS, key=lambda p: EXCHANGE_PLANS[p]["points"], reverse=True):
+        if points >= EXCHANGE_PLANS[plan]["points"]:
+            return plan, ""
+    lowest = min(p["points"] for p in EXCHANGE_PLANS.values())
+    return None, f"⚠️ 剩余{left_days}天，积分不足({points}/{lowest})，请手动续费"
+
+
 def checkin_account(
     session: requests.Session,
     cookie: str,
     index: int,
     exchange_plan: Optional[str] = None,
+    exchange_days_threshold: int = DEFAULT_EXCHANGE_DAYS_THRESHOLD,
 ) -> Dict[str, Any]:
     """执行单个账号的签到，返回账号信息字典
 
-    exchange_plan: 积分兑换计划名（plan100/plan200/plan500），为 None 时不兑换。
+    exchange_plan: 积分兑换计划名（plan100/plan200/plan500/auto），为 None 时不兑换。
+    exchange_days_threshold: auto 模式下触发兑换的剩余天数阈值。
     """
     session.cookies.clear()  # 清除上一个账号的残留 Cookie，避免串扰
     headers = {**HEADERS_BASE}
@@ -635,6 +660,7 @@ def checkin_account(
 
     email = "unknown"
     days = "-"
+    days_int = None  # 剩余天数整数值，用于 auto 兑换判断
     total_points = "-"
     total_points_int = None  # 积分整数值，用于兑换阈值判断
     earned = 0
@@ -671,6 +697,10 @@ def checkin_account(
             email = data.get("email", email)
             if data.get("leftDays") is not None:
                 days = f"{safe_int_str(data['leftDays'])} 天"
+                try:
+                    days_int = int(float(data["leftDays"]))
+                except (TypeError, ValueError):
+                    days_int = None
         except Exception as e:  # noqa: BLE001
             logger.warning("账号 %d 状态查询失败: %s", index, e)
 
@@ -695,6 +725,12 @@ def checkin_account(
 
         # 4. 积分兑换（#9，仅配置了 EXCHANGE_PLAN 时执行；默认关闭不影响现有功能）
         #    兑换独立于签到结果，但仅在成功查到积分后尝试；失败不影响签到状态/退出码。
+        if exchange_plan == EXCHANGE_AUTO:
+            exchange_plan, exchange_status = choose_auto_plan(
+                total_points_int, days_int, exchange_days_threshold,
+            )
+            if exchange_plan is None and exchange_status not in ("-", ""):
+                logger.warning("账号 %d %s", index, exchange_status)
         if exchange_plan and exchange_plan in EXCHANGE_PLANS:
             req_pts = EXCHANGE_PLANS[exchange_plan]["points"]
             days_gain = EXCHANGE_PLANS[exchange_plan]["days"]
@@ -747,8 +783,25 @@ def main() -> int:
 
     # #9：积分兑换计划（可选，默认关闭；仅显式配置且值合法时启用，避免静默消耗积分）
     raw_plan = (os.getenv("EXCHANGE_PLAN") or os.getenv("GLADOS_EXCHANGE_PLAN") or "").strip()
+    raw_threshold = (os.getenv("EXCHANGE_DAYS_THRESHOLD") or "").strip()
+    try:
+        exchange_days_threshold = int(raw_threshold) if raw_threshold else DEFAULT_EXCHANGE_DAYS_THRESHOLD
+    except ValueError:
+        logger.warning(
+            "EXCHANGE_DAYS_THRESHOLD 值 '%s' 无效，使用默认 %d",
+            raw_threshold, DEFAULT_EXCHANGE_DAYS_THRESHOLD,
+        )
+        exchange_days_threshold = DEFAULT_EXCHANGE_DAYS_THRESHOLD
     if raw_plan:
-        if raw_plan in EXCHANGE_PLANS:
+        if raw_plan == EXCHANGE_AUTO:
+            exchange_plan = raw_plan
+            logger.info(
+                "已启用自动兑换: 剩余天数 <= %d 时按 %s 顺序兑换",
+                exchange_days_threshold, " → ".join(
+                    sorted(EXCHANGE_PLANS, key=lambda p: EXCHANGE_PLANS[p]["points"], reverse=True)
+                ),
+            )
+        elif raw_plan in EXCHANGE_PLANS:
             exchange_plan = raw_plan
             logger.info(
                 "已启用积分兑换计划: %s (%d 积分 → %d 天)",
@@ -758,7 +811,7 @@ def main() -> int:
         else:
             logger.warning(
                 "EXCHANGE_PLAN 值 '%s' 无效，可选: %s；本次跳过兑换",
-                raw_plan, "/".join(EXCHANGE_PLANS.keys()),
+                raw_plan, "/".join([*EXCHANGE_PLANS.keys(), EXCHANGE_AUTO]),
             )
             exchange_plan = None
     else:
@@ -790,7 +843,7 @@ def main() -> int:
             logger.info("账号 %d 会话前缀识别为: %s:", idx, extract_session_prefix(cookie))
 
             logger.info("正在处理账号 %d/%d...", idx, len(cookies))
-            acc = checkin_account(session, cookie, idx, exchange_plan)
+            acc = checkin_account(session, cookie, idx, exchange_plan, exchange_days_threshold)
 
             if acc["result"] == "ok":
                 ok += 1

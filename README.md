@@ -107,6 +107,9 @@ gld:sess=xxxxxx; gld:sess.sig=yyyyyy
 | `plan100` | 100 积分 | 10 天 |
 | `plan200` | 200 积分 | 30 天 |
 | `plan500` | 500 积分 | 100 天 |
+| `auto` | 见下 | 见下 |
+
+`auto` 模式：平时只签到不兑换；当**剩余天数 ≤ 阈值**（默认 3 天）时，按 `plan500 → plan200 → plan100` 选积分够得上的最高档兑换一次，一档都不够则在推送中提醒手动续费。阈值可在仓库 Variables 中设置 `EXCHANGE_DAYS_THRESHOLD` 修改。
 
 机制说明：
 
